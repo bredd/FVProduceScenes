@@ -1,0 +1,1054 @@
+﻿/*
+---
+name: WinShellPropertyStore.cs
+description: C# Wrapper for Windows Property System
+url: https://github.com/FileMeta/WinShellPropertyStore/raw/master/WinShellPropertyStore.cs
+version: 1.10
+keywords: CodeBit
+dateModified: 2019-12-28
+license: http://unlicense.org
+dependsOn: https://github.com/FileMeta/WinShellPropertyStore/raw/master/PropVariant.cs https://github.com/FileMeta/WinShellPropertyStore/raw/master/PropertyKey.cs
+# Metadata in MicroYaml format. See http://filemeta.org and http://schema.org
+...
+*/
+
+/*
+Unlicense: http://unlicense.org
+
+This is free and unencumbered software released into the public domain.
+
+Anyone is free to copy, modify, publish, use, compile, sell, or distribute
+this software, either in source code form or as a compiled binary, for any
+purpose, commercial or non-commercial, and by any means.
+
+In jurisdictions that recognize copyright laws, the author or authors of this
+software dedicate any and all copyright interest in the software to the
+public domain. We make this dedication for the benefit of the public at large
+and to the detriment of our heirs and successors. We intend this dedication
+to be an overt act of relinquishment in perpetuity of all present and future
+rights to this software under copyright law.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+For more information, please refer to <http://unlicense.org/>
+*/
+
+/*
+References:
+   Windows Property System: https://msdn.microsoft.com/en-us/library/windows/desktop/ff728898(v=vs.85).aspx
+   Help in managing VARIANT from managed code: https://limbioliong.wordpress.com/2011/09/04/using-variants-in-managed-code-part-1/
+*/
+
+// This interface layer corrects certain problems with the Windows Property Store. To suppress
+// the corrections, uncomment the following line.
+//#define RAW_PROPERTY_STORE
+
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using Interop;
+
+namespace WinShell
+{
+
+    /// <summary>
+    /// Wrapper class for Windows Shell IPropertyStore. Supports read and
+    /// write access to metadata properties on files using the Windows
+    /// Property System.
+    /// </summary>
+    /// <remarks>
+    /// Inherits from IDisposable. You should always use "using" statements
+    /// with this class. If properties are written, be sure to call "commit"
+    /// before the instance is disposed.
+    /// </remarks>
+    class PropertyStore : IDisposable
+    {
+
+#if !RAW_PROPERTY_STORE
+        static PropertyKey s_pkContentType = new PropertyKey("D5CDD502-2E9C-101B-9397-08002B2CF9AE", 26); // System.ContentType
+        static PropertyKey s_pkItemDate = new PropertyKey("f7db74b4-4287-4103-afba-f1b13dcd75cf", 100); // System.ItemDate
+        static PropertyKey s_pkDateTaken = new PropertyKey("14B81DA1-0135-4D31-96D9-6CBFC9671A99", 36867);
+        static PropertyKey s_pkDateEncoded = new PropertyKey("2e4b640d-5019-46d8-8881-55414cc5caa0", 100); // System.Media.DateEncoded
+#endif
+
+        /// <summary>
+        /// Open the property store for a file.
+        /// </summary>
+        /// <param name="filename">Path or filename of file on which to open the property store.</param>
+        /// <param name="writeAccess">True if write access is desired. Defaults to false.</param>
+        /// <returns>A <see cref="PropertyStore"/> instance.</returns>
+        public static PropertyStore Open(string filename, bool writeAccess = false)
+        {
+            PropertyStoreInterop.IPropertyStore store;
+            Guid iPropertyStoreGuid = typeof(PropertyStoreInterop.IPropertyStore).GUID;
+            PropertyStoreInterop.SHGetPropertyStoreFromParsingName(filename, IntPtr.Zero,
+                writeAccess ? PropertyStoreInterop.GETPROPERTYSTOREFLAGS.GPS_READWRITE : PropertyStoreInterop.GETPROPERTYSTOREFLAGS.GPS_BESTEFFORT,
+                ref iPropertyStoreGuid, out store);
+            return new PropertyStore(store);
+        }
+
+        private PropertyStoreInterop.IPropertyStore m_IPropertyStore;
+        private PropertyStoreInterop.IPropertyStoreCapabilities m_IPropertyStoreCapabilities;
+#if !RAW_PROPERTY_STORE
+        private string m_contentType;
+#endif
+
+        private PropertyStore(PropertyStoreInterop.IPropertyStore propertyStore)
+        {
+            m_IPropertyStore = propertyStore;
+#if !RAW_PROPERTY_STORE
+            m_contentType = GetValue(s_pkContentType) as string;
+#endif
+        }
+
+        /// <summary>
+        /// Gets the number of properties attached to the file.
+        /// </summary>
+        public int Count
+        {
+            get
+            {
+                uint value;
+                m_IPropertyStore.GetCount(out value);
+                return (int)value;
+            }
+        }
+
+        /// <summary>
+        /// Gets a property key from an item's array of properties.
+        /// </summary>
+        /// <param name="index">The index of the property key in the property store's
+        /// array of <see cref="PropertyKey"/> structures. This is a zero-based index.</param>
+        /// <returns>The <see cref="PropertyKey"/> at the specified index.</returns>
+        /// <remarks>
+        /// This call, in combination with the <see cref="Count"/> property can be
+        /// used to enumerate all properties in the PropertyStore.
+        /// </remarks>
+        public PropertyKey GetAt(int index)
+        {
+            PropertyKey key;
+            m_IPropertyStore.GetAt((uint)index, out key);
+            return key;
+        }
+
+        /// <summary>
+        /// Gets data for a specific property.
+        /// </summary>
+        /// <param name="key">The <see cref="PropertyKey"/> of the property to be retrieved.</param>
+        /// <returns>The data for the specified property or null if the item does not have the property.</returns>
+        public object GetValue(PropertyKey key)
+        {
+            IntPtr pv = IntPtr.Zero;
+            object value = null;
+            try
+            {
+                pv = Marshal.AllocCoTaskMem(32); // Structure is 16 bytes in 32-bit windows and 24 bytes in 64-bit but we leave a few more bytes for good measure.
+                m_IPropertyStore.GetValue(key, pv);
+                value = PropVariant.GetObjectFromPropVariant(pv);
+
+#if !RAW_PROPERTY_STORE
+                // PropertyStore returns all DateTimes in UTC. However, DateTaken certain fields are stored in local time.
+                // The conversion to UTC will not be correct unless the timezone on the camera, when the
+                // photo was taken, is the same as the timezone on the computer when the value is retrieved.
+                // We fix this up by converting back to local time using the computer's current timezone
+                // (the same timezone that was used to convert to UTC moments earlier).
+                // This works well because unlike the source FILETIME (which should always be UTC), The
+                // managed DateTime format has a property that indicates whether the time is local or UTC.
+                // Callers should still take care to interpret the time as local to where the photo was taken
+                // and not local to where the computer is at present.
+                if (value != null
+                    && (((string.Equals(m_contentType, "image/jpeg") || string.Equals(m_contentType, "image/heic"))
+                        && (key.Equals(s_pkItemDate) || key.Equals(s_pkDateTaken)))
+                    || (string.Equals(m_contentType, "video/avi")
+                        && (key.Equals(s_pkItemDate) || key.Equals(s_pkDateEncoded)))))
+                {
+                    DateTime dt = (DateTime)value;
+                    Debug.Assert(dt.Kind == DateTimeKind.Utc);
+                    value = dt.ToLocalTime();
+                }
+#endif
+            }
+            finally
+            {
+                if (pv != IntPtr.Zero)
+                {
+                    try
+                    {
+                        PropVariant.PropVariantClear(pv);
+                    }
+                    catch
+                    {
+                        Debug.Fail("VariantClear failure");
+                    }
+                    Marshal.FreeCoTaskMem(pv);
+                    pv = IntPtr.Zero;
+                }
+            }
+            return value;
+        }
+
+        /// <summary>
+        /// Sets a new property value, or replaces or removes an existing value.
+        /// </summary>
+        /// <param name="key">The <see cref="PropertyKey"/> of the property to be set.</param>
+        /// <param name="value">The value to be set. Managed code values are converted
+        /// to the appropriate PROPVARIANT values.</param>
+        /// <remarks>
+        /// <para>The property store must be opened with write access. (See <see cref="Open"/>).
+        /// </para>
+        /// <para>Subsequent calls to <see cref="GetCount"/> and <see cref="GetValue"/> will
+        /// reflect the new property.
+        /// </para>
+        /// <para>No changes are made to the underlying file until <see cref="Commit"/> is
+        /// called. If Commit is not called then the changes are discarded.
+        /// </para>
+        /// <para>Removal of a property is not supported by the Windows Property System.
+        /// </para>
+        /// </remarks>
+        public void SetValue(PropertyKey key, object value)
+        {
+            IntPtr pv = IntPtr.Zero;
+            try
+            {
+                if (value is DateTime)
+                {
+                    DateTime dt = (DateTime)value;
+                    value = dt.ToUniversalTime();
+                }
+
+                pv = Marshal.AllocCoTaskMem(PropVariant.sizeofPROPVARIANT);
+                PropVariant.GetPropVariantFromObject(value, pv);
+                m_IPropertyStore.SetValue(key, pv);
+            }
+            finally
+            {
+                if (pv != IntPtr.Zero)
+                {
+                    PropVariant.PropVariantClear(pv);
+                    Marshal.FreeCoTaskMem(pv);
+                    pv = IntPtr.Zero;
+                }
+            }
+        }
+
+        public bool IsPropertyWriteable(PropertyKey key)
+        {
+            if (m_IPropertyStoreCapabilities == null)
+            {
+                m_IPropertyStoreCapabilities = (PropertyStoreInterop.IPropertyStoreCapabilities)m_IPropertyStore;
+            }
+
+            Int32 hResult = m_IPropertyStoreCapabilities.IsPropertyWritable(ref key);
+            if (hResult == 0) return true;
+            if (hResult > 0) return false;
+            Marshal.ThrowExceptionForHR(hResult);
+            return false;   // This should not occur
+        }
+
+        /// <summary>
+        /// Saves a set of property changes to the underlying file.
+        /// </summary>
+        public void Commit()
+        {
+            m_IPropertyStore.Commit();
+        }
+
+        /// <summary>
+        /// Closes the property store and releases all associated resources.
+        /// </summary>
+        public void Dispose()
+        {
+            Dispose(true);
+        }
+
+        ~PropertyStore()
+        {
+            Dispose(false);
+        }
+
+        private void Dispose(bool disposing)
+        {
+            if (m_IPropertyStore != null)
+            {
+                if (!disposing)
+                {
+                    Debug.Fail("Failed to dispose PropertyStore");
+                }
+
+                Marshal.FinalReleaseComObject(m_IPropertyStore);
+                m_IPropertyStore = null;
+            }
+
+            if (m_IPropertyStoreCapabilities != null)
+            {
+                Marshal.FinalReleaseComObject(m_IPropertyStoreCapabilities);
+                m_IPropertyStoreCapabilities = null;
+            }
+
+            if (disposing)
+            {
+                GC.SuppressFinalize(this);
+            }
+        }
+
+    } // class PropertyStore
+
+    /// <summary>
+    /// Wrapper class for Windows Shell IPropertySystem. Provides classes for
+    /// looking up property IDs and translating between property IDs and
+    /// property names.
+    /// </summary>
+    public class PropertySystem : IDisposable
+    {
+        PropertyStoreInterop.IPropertySystem m_IPropertySystem;
+
+        /// <summary>
+        /// Constructs an instance of the PropertySytem object. PropertySystem has no
+        /// state so one instance can be shared across the whole application if that is
+        /// convenient.
+        /// </summary>
+        /// <remarks>
+        /// PropertySystem should be disposed before going out of scope in order to free
+        /// associated system resources.
+        /// </remarks>
+        public PropertySystem()
+        {
+            Guid IID_IPropertySystem = typeof(PropertyStoreInterop.IPropertySystem).GUID;
+            PropertyStoreInterop.PSGetPropertySystem(ref IID_IPropertySystem, out m_IPropertySystem);
+        }
+
+        /// <summary>
+        /// Get the <see cref="PropertyDescription"/> for a particular <see cref="PropertyKey"/>.
+        /// </summary>
+        /// <param name="propKey">The <see cref="PropertyKey"/> for which the description is to be retrieved.</param>
+        /// <returns>A <see cref="PropertyDescription"/>. Null if the PROPERTYKEY does not have a registered description.</returns>
+        public PropertyDescription GetPropertyDescription(PropertyKey propKey)
+        {
+            Int32 hResult;
+            Guid IID_IPropertyDescription = typeof(PropertyStoreInterop.IPropertyDescription).GUID;
+            PropertyStoreInterop.IPropertyDescription iPropertyDescription = null;
+            try
+            {
+                hResult = m_IPropertySystem.GetPropertyDescription(propKey, ref IID_IPropertyDescription, out iPropertyDescription);
+                if (hResult < 0) return null;
+                return new PropertyDescription(iPropertyDescription);
+            }
+            finally
+            {
+                if (iPropertyDescription != null)
+                {
+                    Marshal.FinalReleaseComObject(iPropertyDescription);
+                    iPropertyDescription = null;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Get the <see cref="PropertyDescription"/> that corresponds to a name.
+        /// </summary>
+        /// <param name="canonicalName">The canonical name of the property to be retrieved.</param>
+        /// <returns>The <see cref="PropertyDescription"/> that corresponds to the specified name.</returns>
+        /// <remarks>
+        /// <para>Returns null if no property matches the name.
+        /// </para>
+        /// <para>Canonical names for properties defined by Windows are listed at
+        /// <see cref="https://msdn.microsoft.com/en-us/library/windows/desktop/dd561977(v=vs.85).aspx"/></para>
+        /// </remarks>
+        public PropertyDescription GetPropertyDescriptionByName(string canonicalName)
+        {
+            Int32 hResult;
+            Guid IID_IPropertyDescription = typeof(PropertyStoreInterop.IPropertyDescription).GUID;
+            PropertyStoreInterop.IPropertyDescription iPropertyDescription = null;
+            try
+            {
+                hResult = m_IPropertySystem.GetPropertyDescriptionByName(canonicalName, ref IID_IPropertyDescription, out iPropertyDescription);
+                if (hResult < 0)
+                {
+                    return null;
+                }
+                return new PropertyDescription(iPropertyDescription);
+            }
+            finally
+            {
+                if (iPropertyDescription != null)
+                {
+                    Marshal.FinalReleaseComObject(iPropertyDescription);
+                    iPropertyDescription = null;
+                }
+            }
+        }
+
+        public PropertyKey GetPropertyKeyByName(string canonicalName)
+        {
+            Int32 hResult;
+            PropertyKey propertyKey;    // Initializes automatically to all zeros
+
+            Guid IID_IPropertyDescription = typeof(PropertyStoreInterop.IPropertyDescription).GUID;
+            PropertyStoreInterop.IPropertyDescription iPropertyDescription = null;
+            try
+            {
+                hResult = m_IPropertySystem.GetPropertyDescriptionByName(canonicalName, ref IID_IPropertyDescription, out iPropertyDescription);
+                if (hResult < 0)
+                {
+                    Marshal.ThrowExceptionForHR(hResult);
+                }
+                hResult = iPropertyDescription.GetPropertyKey(out propertyKey);
+                if (hResult < 0)
+                {
+                    Marshal.ThrowExceptionForHR(hResult);
+                }
+            }
+            finally
+            {
+                if (iPropertyDescription != null)
+                {
+                    Marshal.FinalReleaseComObject(iPropertyDescription);
+                    iPropertyDescription = null;
+                }
+            }
+
+            return propertyKey;
+        }
+
+        public void Dispose()
+        {
+            Dispose(true);
+        }
+
+        ~PropertySystem()
+        {
+            Dispose(false);
+        }
+
+        private void Dispose(bool disposing)
+        {
+            if (m_IPropertySystem != null)
+            {
+                if (!disposing)
+                {
+                    Debug.Fail("Failed to dispose PropertySystem");
+                }
+
+                Marshal.FinalReleaseComObject(m_IPropertySystem);
+                m_IPropertySystem = null;
+            }
+            if (disposing)
+            {
+                GC.SuppressFinalize(this);
+            }
+        }
+
+        /*
+        Other members not wrapped
+            GetPropertyDescriptionListFromString
+            EnumeratePropertyDescriptions
+            FormatForDisplay
+            RegisterPropertySchema
+            UnregisterPropertySchema
+            RefreshPropertySchema
+        */
+
+    } // class PropertySystem
+
+    /// <summary>
+    /// Wrapper class for IPropertyDescription. Provides information about a particular Windows
+    /// Property Store property.
+    /// </summary>
+    public class PropertyDescription
+    {
+        PropertyKey m_propertyKey;
+        string m_canonicalName;
+        string m_displayName;
+        PROPDESC_TYPE_FLAGS m_typeFlags;
+        PROPDESC_VIEW_FLAGS m_viewFlags;
+        PROPDESC_DISPLAYTYPE m_displayType;
+        ushort m_vt; // Variant type from which the managed type is derived.
+
+#if !RAW_PROPERTY_STORE
+        // These properties should be marked as innate or read-only but, at least in Windows 10,
+        // they are not. If not RAW_PROPERTY_STORE compile-time option then we modify them.
+        static HashSet<PropertyKey> s_ForceInnate = new HashSet<PropertyKey>(
+            new PropertyKey[]
+            {
+                new PropertyKey("D5CDD502-2E9C-101B-9397-08002B2CF9AE", 26), // System.ContentType
+                new PropertyKey("D6942081-D53B-443D-AD47-5E059D9CD27A", 2), // System.Shell.SFGAOFlagsStrings
+                new PropertyKey("09329b74-40a3-4c68-bf07-af9a572f607c", 100), // System.IsFolder
+                new PropertyKey("14b81da1-0135-4d31-96d9-6cbfc9671a99", 18258), // System.DateImported
+                new PropertyKey("2e4b640d-5019-46d8-8881-55414cc5caa0", 100) // System.Media.DateEncoded
+    });
+#endif
+
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="iPropertyDescription"></param>
+        /// <remarks>
+        /// <para>In order to avoid having to make this class disposable, it retrieves all values
+        /// from IPropertyDescription in the constructor. The caller should release iPropertyDescription.
+        /// </para>
+        /// </remarks>
+        internal PropertyDescription(PropertyStoreInterop.IPropertyDescription iPropertyDescription)
+        {
+            Int32 hResult;
+
+            // Get Property Key
+            hResult = iPropertyDescription.GetPropertyKey(out m_propertyKey);
+            if (hResult < 0)
+            {
+                Marshal.ThrowExceptionForHR(hResult);
+            }
+
+            // Get Canonical Name
+            IntPtr pszName = IntPtr.Zero;
+            try
+            {
+                hResult = iPropertyDescription.GetCanonicalName(out pszName);
+                if (hResult >= 0 && pszName != IntPtr.Zero)
+                {
+                    m_canonicalName = Marshal.PtrToStringUni(pszName);
+                }
+                else
+                {
+                    Marshal.ThrowExceptionForHR(hResult);
+                }
+            }
+            finally
+            {
+                if (pszName != IntPtr.Zero)
+                {
+                    Marshal.FreeCoTaskMem(pszName);
+                    pszName = IntPtr.Zero;
+                }
+            }
+
+            // Get Display Name
+            pszName = IntPtr.Zero;
+            try
+            {
+                hResult = iPropertyDescription.GetDisplayName(out pszName);
+                if (hResult >= 0 && pszName != IntPtr.Zero)
+                {
+                    m_displayName = Marshal.PtrToStringUni(pszName);
+                }
+                else
+                {
+                    m_displayName = null;
+                }
+            }
+            finally
+            {
+                if (pszName != IntPtr.Zero)
+                {
+                    Marshal.FreeCoTaskMem(pszName);
+                    pszName = IntPtr.Zero;
+                }
+            }
+
+            // Get Type
+            hResult = iPropertyDescription.GetPropertyType(out m_vt);
+            if (hResult < 0)
+            {
+                m_vt = 0;
+                Debug.Fail("IPropertyDescription.GetPropertyType failed.");
+            }
+
+            // Get Type Flags
+            hResult = iPropertyDescription.GetTypeFlags(PROPDESC_TYPE_FLAGS.PDTF_MASK_ALL, out m_typeFlags);
+            if (hResult < 0)
+            {
+                m_typeFlags = 0;
+                Debug.Fail("IPropertyDescription.GetTypeFlags failed.");
+            }
+#if !RAW_PROPERTY_STORE
+            if (s_ForceInnate.Contains(m_propertyKey))
+            {
+                m_typeFlags |= PROPDESC_TYPE_FLAGS.PDTF_ISINNATE;
+            }
+#endif
+
+            // Get View Flags
+            hResult = iPropertyDescription.GetViewFlags(out m_viewFlags);
+            if (hResult < 0)
+            {
+                m_viewFlags = 0;
+                Debug.Fail("IPropertyDescription.GetViewFlags failed.");
+            }
+
+            // Get Display type
+            hResult = iPropertyDescription.GetDisplayType(out m_displayType);
+            if (hResult < 0)
+            {
+                m_displayType = 0;
+                Debug.Fail("IPropertyDescription.GetDisplayType failed.");
+            }
+        }
+
+        /// <summary>
+        /// The <see cref="WinShell.PropertyKey"/> that identifies the property.
+        /// </summary>
+        public PropertyKey PropertyKey
+        {
+            get { return m_propertyKey; }
+        }
+
+        /// <summary>
+        /// The canonical name for the property.
+        /// </summary>
+        /// <remarks>
+        /// A typical canonical name is "System.Image.HorizontalSize"
+        /// </remarks>
+        public string CanonicalName
+        {
+            get { return m_canonicalName; }
+        }
+
+        /// <summary>
+        /// The display name for the property or null.
+        /// </summary>
+        /// <remarks>
+        /// <para>A typical display name is "Width".</para>
+        /// <para>Not all properties have display names. If a display name is not assigned, the value will be null.
+        /// </para>
+        /// </remarks>
+        public string DisplayName
+        {
+            get { return m_displayName; }
+        }
+
+        /// <summary>
+        /// The <see cref="PROPDESC_TYPE_FLAGS"/> for the property.
+        /// </summary>
+        /// <remarks>
+        /// <see cref="PROPDESC_TYPE_FLAGS"/> is a bitmask and multiple flags may be set.
+        /// </remarks>
+        public PROPDESC_TYPE_FLAGS TypeFlags
+        {
+            get { return m_typeFlags; }
+        }
+
+        /// <summary>
+        /// The <see cref="PROPDESC_VIEW_FLAGS"/> for the property.
+        /// </summary>
+        /// <remarks>
+        /// <see cref="PROPDESC_VIEW_FLAGS"/> is a bitmask and multiple flags may be set.
+        /// </remarks>
+        public PROPDESC_VIEW_FLAGS ViewFlags
+        {
+            get { return m_viewFlags; }
+        }
+
+        /// <summary>
+        /// The managed type that is used to represent this property value.
+        /// </summary>
+        /// <remarks>
+        /// Value is null if the property value type is not supported by the managed wrapper
+        /// </remarks>
+        public Type ValueType
+        {
+            get
+            {
+                return PropVariant.GetManagedTypeFromVariantType((PropVariant.VT)m_vt);
+            }
+        } // ValueType
+
+        /// <summary>
+        /// The <see cref="PropertyStoreInterop.PROPDESC_DISPLAYTYPE"/> for the property.
+        /// </summary>
+        public PROPDESC_DISPLAYTYPE DisplayType => m_displayType;
+
+        public bool Equals(PropertyDescription pd)
+        {
+            if (pd == null) return false;
+            return m_propertyKey.Equals(pd.m_propertyKey);
+        }
+
+        public override bool Equals(object obj)
+        {
+            return Equals(obj as PropertyDescription);
+        }
+
+        public override int GetHashCode()
+        {
+            return m_propertyKey.GetHashCode();
+        }
+
+        public override string ToString()
+        {
+            return m_canonicalName;
+        }
+
+        /*
+        Other Members not implemented
+            PropertyType
+            EditInvitation
+            DefaultColumnWidth
+            DisplayType
+            ColumnState
+            GroupingRange
+            RelativeDescriptionType
+            RelativeDescription
+            SortDescription
+            SortDescriptionLabel
+            AggregationType
+            ConditionType
+            EnumTypeList
+            CoerceToCanonicalValue
+            FormatForDisplay
+            IsValueCanonical
+        */
+    } // class PropertyDescription
+
+    /// <summary>
+    /// Declares the values of the <see cref="PropertyDescription.TypeFlags"/> property.
+    /// </summary>
+    /// <remarks>
+    /// See <seealso cref="https://msdn.microsoft.com/en-us/library/windows/desktop/bb762527(v=vs.85).aspx"/> for definitions.
+    /// </remarks>
+    [Flags]
+    public enum PROPDESC_TYPE_FLAGS : uint
+    {
+        PDTF_DEFAULT = 0x00000000,
+        PDTF_MULTIPLEVALUES = 0x00000001,
+        PDTF_ISINNATE = 0x00000002,
+        PDTF_ISGROUP = 0x00000004,
+        PDTF_CANGROUPBY = 0x00000008,
+        PDTF_CANSTACKBY = 0x00000010,
+        PDTF_ISTREEPROPERTY = 0x00000020,
+        PDTF_INCLUDEINFULLTEXTQUERY = 0x00000040,
+        PDTF_ISVIEWABLE = 0x00000080,
+        PDTF_ISQUERYABLE = 0x00000100,
+        PDTF_CANBEPURGED = 0x00000200,
+        PDTF_SEARCHRAWVALUE = 0x00000400,
+        PDTF_ISSYSTEMPROPERTY = 0x80000000,
+        PDTF_MASK_ALL = 0x800007FF
+    }
+
+    /// <summary>
+    /// Declares the values of the <see cref="PropertyDescription.ViewFlags"/> property.
+    /// </summary>
+    /// <remarks>
+    /// See <seealso cref="https://msdn.microsoft.com/en-us/library/windows/desktop/bb762528(v=vs.85).aspx"/> for definitions.
+    /// </remarks>
+    [Flags]
+    public enum PROPDESC_VIEW_FLAGS : uint
+    {
+        PDVF_DEFAULT = 0x00000000,
+        PDVF_CENTERALIGN = 0x00000001,
+        PDVF_RIGHTALIGN = 0x00000002,
+        PDVF_BEGINNEWGROUP = 0x00000004,
+        PDVF_FILLAREA = 0x00000008,
+        PDVF_SORTDESCENDING = 0x00000010,
+        PDVF_SHOWONLYIFPRESENT = 0x00000020,
+        PDVF_SHOWBYDEFAULT = 0x00000040,
+        PDVF_SHOWINPRIMARYLIST = 0x00000080,
+        PDVF_SHOWINSECONDARYLIST = 0x00000100,
+        PDVF_HIDELABEL = 0x00000200,
+        PDVF_HIDDEN = 0x00000800,
+        PDVF_CANWRAP = 0x00001000,
+        PDVF_MASK_ALL = 0x00001BFF
+    }
+
+    /// <summary>
+    /// Declares the values of the <see cref="PropertyDescription.DisplayType"/> property.
+    /// </summary>
+    /// <remarks>
+    /// See <seealso cref="https://docs.microsoft.com/en-us/windows/desktop/api/propsys/nf-propsys-ipropertydescription-getdisplaytype"/> for definitions.
+    /// </remarks>
+    public enum PROPDESC_DISPLAYTYPE : int
+    {
+        PDDT_STRING = 0,
+        PDDT_NUMBER = 1,
+        PDDT_BOOLEAN = 2,
+        PDDT_DATETIME = 3,
+        PDDT_ENUMERATED = 4,    // Use GetEnumTypeList
+    }
+
+    internal static class PropertyStoreInterop
+    {
+        /*
+        // The C++ Version
+        interface IPropertyStore : IUnknown
+        {
+            HRESULT GetCount([out] DWORD *cProps);
+            HRESULT GetAt([in] DWORD iProp, [out] PROPERTYKEY *pkey);
+            HRESULT GetValue([in] REFPROPERTYKEY key, [out] PROPVARIANT *pv);
+            HRESULT SetValue([in] REFPROPERTYKEY key, [in] REFPROPVARIANT propvar);
+            HRESULT Commit();
+        }
+        */
+        [ComImport, Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        public interface IPropertyStore
+        {
+            void GetCount([Out] out uint cProps);
+
+            void GetAt([In] uint iProp, [Out] out PropertyKey pkey);
+
+            void GetValue([In] ref PropertyKey key, [In] IntPtr pv);
+
+            void SetValue([In] ref PropertyKey key, [In] IntPtr pv);
+
+            void Commit();
+        }
+
+        /*
+        // The C++ Version
+        MIDL_INTERFACE("c8e2d566-186e-4d49-bf41-6909ead56acc")
+        interface IPropertyStoreCapabilities : public IUnknown
+        {
+            virtual HRESULT STDMETHODCALLTYPE IsPropertyWritable([in] REFPROPERTYKEY key);
+        };
+        */
+        [ComImport, Guid("c8e2d566-186e-4d49-bf41-6909ead56acc"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        public interface IPropertyStoreCapabilities
+        {
+            [PreserveSig]
+            Int32 IsPropertyWritable([In] ref PropertyKey pkey);
+        }
+
+        /*
+        // The C++ Version
+        MIDL_INTERFACE("ca724e8a-c3e6-442b-88a4-6fb0db8035a3")
+        IPropertySystem : public IUnknown
+        {
+        public:
+            virtual HRESULT STDMETHODCALLTYPE GetPropertyDescription( 
+                __RPC__in REFPROPERTYKEY propkey,
+                __RPC__in REFIID riid,
+                __RPC__deref_out_opt void **ppv) = 0;
+        
+            virtual HRESULT STDMETHODCALLTYPE GetPropertyDescriptionByName( 
+                __RPC__in_string LPCWSTR pszCanonicalName,
+                __RPC__in REFIID riid,
+                __RPC__deref_out_opt void **ppv) = 0;
+        
+            virtual HRESULT STDMETHODCALLTYPE GetPropertyDescriptionListFromString( 
+                __RPC__in_string LPCWSTR pszPropList,
+                __RPC__in REFIID riid,
+                __RPC__deref_out_opt void **ppv) = 0;
+        
+            virtual HRESULT STDMETHODCALLTYPE EnumeratePropertyDescriptions( 
+                PROPDESC_ENUMFILTER filterOn,
+                __RPC__in REFIID riid,
+                __RPC__deref_out_opt void **ppv) = 0;
+        
+            virtual HRESULT STDMETHODCALLTYPE FormatForDisplay( 
+                __RPC__in REFPROPERTYKEY key,
+                __RPC__in REFPROPVARIANT propvar,
+                PROPDESC_FORMAT_FLAGS pdff,
+                __RPC__out_ecount_full_string(cchText) LPWSTR pszText,
+                __RPC__in_range(0,0x8000) DWORD cchText) = 0;
+        
+            virtual HRESULT STDMETHODCALLTYPE FormatForDisplayAlloc( 
+                __RPC__in REFPROPERTYKEY key,
+                __RPC__in REFPROPVARIANT propvar,
+                PROPDESC_FORMAT_FLAGS pdff,
+                __RPC__deref_out_opt_string LPWSTR *ppszDisplay) = 0;
+        
+            virtual HRESULT STDMETHODCALLTYPE RegisterPropertySchema( 
+                __RPC__in_string LPCWSTR pszPath) = 0;
+        
+            virtual HRESULT STDMETHODCALLTYPE UnregisterPropertySchema( 
+                __RPC__in_string LPCWSTR pszPath) = 0;
+        
+            virtual HRESULT STDMETHODCALLTYPE RefreshPropertySchema( void) = 0;
+        
+        };
+        */
+        [ComImport, Guid("ca724e8a-c3e6-442b-88a4-6fb0db8035a3"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        public interface IPropertySystem
+        {
+            [PreserveSig]
+            Int32 GetPropertyDescription([In] ref PropertyKey propkey, [In] ref Guid riid, [Out] out IPropertyDescription rPropertyDescription);
+
+            [PreserveSig]
+            Int32 GetPropertyDescriptionByName([In][MarshalAs(UnmanagedType.LPWStr)] string pszCanonicalName, [In] ref Guid riid, [Out] out IPropertyDescription rPropertyDescription);
+
+            // === All Other Methods Deferred Until Later! ===
+        }
+
+        /*
+        // The C++ Version
+        MIDL_INTERFACE("6f79d558-3e96-4549-a1d1-7d75d2288814")
+        IPropertyDescription : public IUnknown
+        {
+        public:
+            virtual HRESULT STDMETHODCALLTYPE GetPropertyKey( 
+                __RPC__out PROPERTYKEY *pkey) = 0;
+        
+            virtual HRESULT STDMETHODCALLTYPE GetCanonicalName( 
+                __RPC__deref_out_opt_string LPWSTR *ppszName) = 0;
+        
+            virtual HRESULT STDMETHODCALLTYPE GetPropertyType( 
+                __RPC__out VARTYPE *pvartype) = 0;
+        
+            virtual HRESULT STDMETHODCALLTYPE GetDisplayName( 
+                __RPC__deref_out_opt_string LPWSTR *ppszName) = 0;
+        
+            virtual HRESULT STDMETHODCALLTYPE GetEditInvitation( 
+                __RPC__deref_out_opt_string LPWSTR *ppszInvite) = 0;
+        
+            virtual HRESULT STDMETHODCALLTYPE GetTypeFlags( 
+                PROPDESC_TYPE_FLAGS mask,
+                __RPC__out PROPDESC_TYPE_FLAGS *ppdtFlags) = 0;
+        
+            virtual HRESULT STDMETHODCALLTYPE GetViewFlags( 
+                __RPC__out PROPDESC_VIEW_FLAGS *ppdvFlags) = 0;
+        
+            virtual HRESULT STDMETHODCALLTYPE GetDefaultColumnWidth( 
+                __RPC__out UINT *pcxChars) = 0;
+        
+            virtual HRESULT STDMETHODCALLTYPE GetDisplayType( 
+                __RPC__out PROPDESC_DISPLAYTYPE *pdisplaytype) = 0;
+        
+            virtual HRESULT STDMETHODCALLTYPE GetColumnState( 
+                __RPC__out SHCOLSTATEF *pcsFlags) = 0;
+        
+            virtual HRESULT STDMETHODCALLTYPE GetGroupingRange( 
+                __RPC__out PROPDESC_GROUPING_RANGE *pgr) = 0;
+        
+            virtual HRESULT STDMETHODCALLTYPE GetRelativeDescriptionType( 
+                __RPC__out PROPDESC_RELATIVEDESCRIPTION_TYPE *prdt) = 0;
+        
+            virtual HRESULT STDMETHODCALLTYPE GetRelativeDescription( 
+                __RPC__in REFPROPVARIANT propvar1,
+                __RPC__in REFPROPVARIANT propvar2,
+                __RPC__deref_out_opt_string LPWSTR *ppszDesc1,
+                __RPC__deref_out_opt_string LPWSTR *ppszDesc2) = 0;
+        
+            virtual HRESULT STDMETHODCALLTYPE GetSortDescription( 
+                __RPC__out PROPDESC_SORTDESCRIPTION *psd) = 0;
+        
+            virtual HRESULT STDMETHODCALLTYPE GetSortDescriptionLabel( 
+                BOOL fDescending,
+                __RPC__deref_out_opt_string LPWSTR *ppszDescription) = 0;
+        
+            virtual HRESULT STDMETHODCALLTYPE GetAggregationType( 
+                __RPC__out PROPDESC_AGGREGATION_TYPE *paggtype) = 0;
+        
+            virtual HRESULT STDMETHODCALLTYPE GetConditionType( 
+                __RPC__out PROPDESC_CONDITION_TYPE *pcontype,
+                __RPC__out CONDITION_OPERATION *popDefault) = 0;
+        
+            virtual HRESULT STDMETHODCALLTYPE GetEnumTypeList( 
+                __RPC__in REFIID riid,
+                __RPC__deref_out_opt void **ppv) = 0;
+        
+            virtual HRESULT STDMETHODCALLTYPE CoerceToCanonicalValue( 
+                _Inout_  PROPVARIANT *ppropvar) = 0;
+        
+            virtual HRESULT STDMETHODCALLTYPE FormatForDisplay( 
+                __RPC__in REFPROPVARIANT propvar,
+                PROPDESC_FORMAT_FLAGS pdfFlags,
+                __RPC__deref_out_opt_string LPWSTR *ppszDisplay) = 0;
+        
+            virtual HRESULT STDMETHODCALLTYPE IsValueCanonical( 
+                __RPC__in REFPROPVARIANT propvar) = 0;
+        
+        };
+        */
+        [ComImport, Guid("6f79d558-3e96-4549-a1d1-7d75d2288814"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        public interface IPropertyDescription
+        {
+            [PreserveSig]
+            Int32 GetPropertyKey([Out] out PropertyKey pkey);
+
+            [PreserveSig]
+            Int32 GetCanonicalName([Out] out IntPtr ppszName);
+
+            [PreserveSig]
+            Int32 GetPropertyType([Out] out ushort vartype);
+
+            [PreserveSig]
+            Int32 GetDisplayName([Out] out IntPtr ppszName);
+
+            [PreserveSig]
+            Int32 GetEditInvitation([Out] out IntPtr ppszInvite);
+
+            [PreserveSig]
+            Int32 GetTypeFlags([In] PROPDESC_TYPE_FLAGS mask, [Out] out PROPDESC_TYPE_FLAGS ppdtFlags);
+
+            [PreserveSig]
+            Int32 GetViewFlags([Out] out PROPDESC_VIEW_FLAGS ppdtFlags);
+
+            [PreserveSig]
+            Int32 GetDefaultColumnWidth([Out] out int pcxChars);
+
+            [PreserveSig]
+            Int32 GetDisplayType([Out] out PROPDESC_DISPLAYTYPE pdisplaytype);
+
+            [PreserveSig]
+            Int32 GetColumnState([Out] out Int32 pcsFlags);
+
+            [PreserveSig]
+            Int32 GetGroupingRange([Out] out Int32 pgr);
+
+            [PreserveSig]
+            Int32 GetRelativeDescriptionType([Out] out Int32 prdt);
+
+            [PreserveSig]
+            Int32 GetRelativeDescription([In] IntPtr propvar1, [In] IntPtr propvar2, [Out] out IntPtr ppszDesc1, [Out] out IntPtr ppszDesc2);
+
+            [PreserveSig]
+            Int32 GetSortDescription([Out] out Int32 psd);
+
+            [PreserveSig]
+            Int32 GetSortDescriptionLabel(int fDescending, [Out] out IntPtr ppszLabel);
+
+            [PreserveSig]
+            Int32 GetAggregationType([Out] out Int32 paggtype);
+
+            [PreserveSig]
+            Int32 GetConditionType([Out] out Int32 pcontype, [Out] out Int32 popDefault);
+
+            //[PreserveSig]
+            //Int32 GetEnumTypeList([In] ref Guid riid, [Out] out IPropertyEnumTypeList ppv);
+
+            // === All Other Methods Deferred Until Later! ===
+        }
+
+        [DllImport("shell32.dll", SetLastError = true, CallingConvention = CallingConvention.StdCall, PreserveSig = false)]
+        public static extern void SHGetPropertyStoreFromParsingName(
+                [In][MarshalAs(UnmanagedType.LPWStr)] string pszPath,
+                [In] IntPtr zeroWorks,
+                [In] GETPROPERTYSTOREFLAGS flags,
+                [In] ref Guid iIdPropStore,
+                [Out] out IPropertyStore propertyStore);
+
+        [DllImport("propsys.dll", SetLastError = true, CallingConvention = CallingConvention.StdCall, PreserveSig = false)]
+        public static extern void PSGetPropertySystem([In] ref Guid iIdPropertySystem, [Out] out IPropertySystem propertySystem);
+
+        [Flags]
+        public enum GETPROPERTYSTOREFLAGS : uint
+        {
+            // If no flags are specified (GPS_DEFAULT), a read-only property store is returned that includes properties for the file or item.
+            // In the case that the shell item is a file, the property store contains:
+            //     1. properties about the file from the file system
+            //     2. properties from the file itself provided by the file's property handler, unless that file is offline,
+            //     see GPS_OPENSLOWITEM
+            //     3. if requested by the file's property handler and supported by the file system, properties stored in the
+            //     alternate property store.
+            //
+            // Non-file shell items should return a similar read-only store
+            //
+            // Specifying other GPS_ flags modifies the store that is returned
+            GPS_DEFAULT = 0x00000000,
+            GPS_HANDLERPROPERTIESONLY = 0x00000001,   // only include properties directly from the file's property handler
+            GPS_READWRITE = 0x00000002,   // Writable stores will only include handler properties
+            GPS_TEMPORARY = 0x00000004,   // A read/write store that only holds properties for the lifetime of the IShellItem object
+            GPS_FASTPROPERTIESONLY = 0x00000008,   // do not include any properties from the file's property handler (because the file's property handler will hit the disk)
+            GPS_OPENSLOWITEM = 0x00000010,   // include properties from a file's property handler, even if it means retrieving the file from offline storage.
+            GPS_DELAYCREATION = 0x00000020,   // delay the creation of the file's property handler until those properties are read, written, or enumerated
+            GPS_BESTEFFORT = 0x00000040,   // For readonly stores, succeed and return all available properties, even if one or more sources of properties fails. Not valid with GPS_READWRITE.
+            GPS_NO_OPLOCK = 0x00000080,   // some data sources protect the read property store with an oplock, this disables that
+            GPS_MASK_VALID = 0x000000FF,
+        }
+
+    } // class PropertyStoreInterop
+
+} // namespace WinShell
