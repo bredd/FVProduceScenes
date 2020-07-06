@@ -59,11 +59,7 @@ Options:
             }
             catch (Exception err)
             {
-#if DEBUG
                 Console.WriteLine(err.ToString());
-#else
-                Console.WriteLine(err.Message);
-#endif
             }
 
 #if DEBUG
@@ -169,7 +165,7 @@ Options:
                         }
                     }
 
-                    if (segment.Date > lastDate)
+                    if (segment.Date != lastDate)
                     {
                         ordinal = 0;
                     }
@@ -184,7 +180,7 @@ Options:
 
         static void ProduceScene(string filename, int ordinal, TimeSpan start, TimeSpan end, DateTime date, string subject, string title)
         {
-            string dstFilename = GenerateFilename(date, ordinal, subject, title);
+            string dstFilename = GenerateFilename(s_destFolder, date, ordinal, subject, title);
             Console.WriteLine(dstFilename);
 
             // Print the info
@@ -221,15 +217,20 @@ Options:
             }
             Console.WriteLine();
 
+            ApplyMetadata(dstFilename, date, ordinal, subject, title);
+        }
+
+        static void ApplyMetadata(string filename, DateTime date, int ordinal, string subject, string title)
+        {
             // If only date, not time, translate ordinal into seconds
             bool dateOnly = (date.Hour == 0 && date.Minute == 0 && date.Second == 0);
             if (dateOnly)
             {
-                date = new DateTime(date.Year, date.Month, date.Day, 12+(ordinal / (60 * 60)), (ordinal / 60) % 60, ordinal % 60, DateTimeKind.Utc);
+                date = new DateTime(date.Year, date.Month, date.Day, 12 + (ordinal / (60 * 60)), (ordinal / 60) % 60, ordinal % 60, DateTimeKind.Utc);
             }
 
             // Apply date metadata
-            using (var isom = new FileMeta.IsomCoreMetadata(dstFilename, true))
+            using (var isom = new FileMeta.IsomCoreMetadata(filename, true))
             {
                 isom.CreationTime = date;
                 isom.ModificationTime = date;
@@ -237,14 +238,14 @@ Options:
             }
 
             // Apply the balance of the metadata
-            using (var ps = WinShell.PropertyStore.Open(dstFilename, true))
+            using (var ps = WinShell.PropertyStore.Open(filename, true))
             {
                 string metaTitle = null;
                 if (!string.IsNullOrEmpty(subject))
                 {
                     if (!string.IsNullOrEmpty(title))
                     {
-                        metaTitle = string.Concat(subject, " - ", title);
+                        metaTitle = string.Concat(subject, "+", title);
                     }
                     else
                     {
@@ -261,6 +262,13 @@ Options:
                     ps.SetValue(s_pkTitle, metaTitle);
                 }
 
+                if (!string.IsNullOrEmpty(subject))
+                {
+                    ps.SetValue(s_pkSubject, subject);
+                }
+
+                ps.SetValue(s_pkKeywords, new string[] { "Video8" });
+
                 ps.SetValue(s_pkTrackNum, (uint)ordinal);
 
                 string comment = "&timezone=0";
@@ -271,9 +279,10 @@ Options:
                 ps.SetValue(s_pkComment, comment);
                 ps.Commit();
             }
+
         }
 
-        static string GenerateFilename(DateTime date, int ordinal, string subject, string title)
+        static string GenerateFilename(string folder, DateTime date, int ordinal, string subject, string title)
         {
             for (char attempt=(char)('a'-1); attempt<'z'; ++attempt)
             {
@@ -289,12 +298,12 @@ Options:
                 title = title.Trim();
                 if (!string.IsNullOrEmpty(title))
                 {
-                    filename = string.Concat(filename, " - ", title);
+                    filename = string.Concat(filename, "+", title);
                 }
 
                 filename += ".mp4";
 
-                filename = Path.Combine(s_destFolder, filename);
+                filename = Path.Combine(folder, filename);
 
                 if (!File.Exists(filename))
                 {
@@ -304,10 +313,62 @@ Options:
             throw new ApplicationException("Too many duplicates.");
         }
 
+        /*
+        static string GenerateLegacyFilename(DateTime date, int ordinal, string subject, string title)
+        {
+            var filename = $"{date:yyyy-MM-dd} ({ordinal:d2})";
+            //var filename = $"{date:yyyy-MM-dd} {ordinal:d2}";
+
+            subject = subject.Trim();
+            if (!string.IsNullOrEmpty(subject))
+            {
+                filename = string.Concat(filename, " ", subject);
+            }
+
+            title = title.Trim();
+            if (!string.IsNullOrEmpty(title))
+            {
+                filename = string.Concat(filename, " - ", title);
+            }
+
+            filename += ".mp4";
+
+            return filename;
+        }
+
+        static string GenerateFolderName(DateTime date, string subject)
+        {
+            return $"\\\\akershus\\archive\\Photos\\{date:yyyy}\\{date:MM MMMM}\\{date:dd}~{date:ddd} {subject}";
+        }
+
+        static void UpdateScene(string filename, int ordinal, TimeSpan start, TimeSpan end, DateTime date, string subject, string title)
+        {
+            string folder = s_destFolder; // GenerateFolderName(date, subject);
+            var legacyFn = Path.Combine(folder, GenerateLegacyFilename(date, ordinal, subject, title));
+            if (!File.Exists(legacyFn))
+            {
+                Console.WriteLine($"=== Not Found === {legacyFn}");
+                return;
+            }
+            Console.WriteLine($"Found: {legacyFn}");
+            string newFn = GenerateFilename(folder, date, ordinal, subject, title);
+
+            if (!newFn.Equals(legacyFn, StringComparison.Ordinal))
+            {
+                Console.WriteLine("  Rename");
+                File.Move(legacyFn, newFn);
+            }
+
+            ApplyMetadata(newFn, date, ordinal, subject, title);
+        }
+        */
+
         // https://docs.microsoft.com/en-us/windows/win32/properties/props
         public static PropertyKey s_pkDuration = new PropertyKey("64440490-4C8B-11D1-8B70-080036B11A03", 3);
         public static PropertyKey s_pkComment = new PropertyKey("F29F85E0-4FF9-1068-AB91-08002B27B3D9", 6); // 
         public static PropertyKey s_pkTitle = new PropertyKey("F29F85E0-4FF9-1068-AB91-08002B27B3D9", 2); // System.Title
+        public static PropertyKey s_pkSubject = new PropertyKey("F29F85E0-4FF9-1068-AB91-08002B27B3D9", 3); // System.Subject
+        public static PropertyKey s_pkKeywords = new PropertyKey("F29F85E0-4FF9-1068-AB91-08002B27B3D9", 5); // System.Keywords
         public static PropertyKey s_pkTrackNum = new PropertyKey("56A3372E-CE9C-11D2-9F0E-006097C686F6", 7); // System.Music.TrackNumber
 
     }
