@@ -45,9 +45,15 @@ Options:
                         throw new ArgumentException("Destination folder does not exist: " + s_destFolder);
                     }
 
+                    int count = 0;
                     foreach (var filename in CodeBit.PathEx.GetFilesByPattern(args[0]))
                     {
                         ProcessFile(filename);
+                        ++count;
+                    }
+                    if (count <= 0)
+                    {
+                        throw new Exception("No matches for pattern: " + args[0]);
                     }
                 }
             }
