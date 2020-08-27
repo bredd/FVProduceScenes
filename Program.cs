@@ -87,16 +87,21 @@ Options:
                 }
                 else if (s_srcFilename == null)
                 {
-                    s_srcFilename = arg;
+                    s_srcFilename = Path.GetFullPath(arg);
                 }
                 else if (s_destFolder == null)
                 {
-                    s_destFolder = arg;
+                    s_destFolder = Path.GetFullPath(arg);
                 }
                 else
                 {
                     throw new ApplicationException("Unexpected command-line argument: " + arg);
                 }
+            }
+
+            if (string.IsNullOrEmpty(s_srcFilename) || string.IsNullOrEmpty(s_destFolder))
+            {
+                s_showSyntax = true;
             }
         }
 
@@ -178,6 +183,9 @@ Options:
 
         }
 
+        const string c_ffMpegOptionsForMp4 = "-vf \"unsharp\" -c:v libx264 -profile:v main -level:v 3.1 -crf 20 -c:a aac -movflags +faststart";
+        const string c_ffMpegOptionsForAvi = "-vf \"yadif=1,unsharp\" -pix_fmt yuv420p -c:v libx264 -profile:v main -level:v 3.1 -crf 20 -c:a aac -movflags +faststart";
+
         static void ProduceScene(string filename, int ordinal, TimeSpan start, TimeSpan end, DateTime date, string subject, string title)
         {
             string dstFilename = GenerateFilename(s_destFolder, date, ordinal, subject, title);
@@ -199,11 +207,17 @@ Options:
             // This version has precise cuts and uses the unsharp filter which actually sharpens the output.
             //string arguments = $"-hide_banner -i \"{filename}\" -ss {start.Ticks / 10}us -to {end.Ticks / 10}us -vf unsharp -c:v libx264 -profile:v main -level:v 3.1 -crf 20 -c:a aac \"{dstFilename}\"";
 
-            // This version has precise cuts, uses the unsharp filter, and adds +faststart for quicker loading
-            string arguments = $"-hide_banner -i \"{filename}\" -ss {start.Ticks / 10}us -to {end.Ticks / 10}us -vf unsharp -c:v libx264 -profile:v main -level:v 3.1 -crf 20 -c:a aac -movflags +faststart \"{dstFilename}\"";
+            // This version fixes the pixel format
+            //string arguments = $"-hide_banner -i \"{filename}\" -ss {start.Ticks / 10}us -to {end.Ticks / 10}us -vf unsharp -pix_fmt yuv420p -c:v libx264 -profile:v main -level:v 3.1 -crf 20 -c:a aac -movflags +faststart \"{dstFilename}\"";
 
             // This version is an attempt to speed things up by not having to read all of the video up to the cut point. But it doesn't work - it sums up both delays.
             //string arguments = $"-hide_banner -ss {start.Ticks / 10}us -i \"{filename}\" -ss {start.Ticks / 10}us -to {end.Ticks / 10}us -c:v libx264 -profile:v main -level:v 3.1 -crf 20 -c:a aac \"{dstFilename}\"";
+
+            string options = (Path.GetExtension(filename).Equals(".avi", StringComparison.OrdinalIgnoreCase))
+                ? c_ffMpegOptionsForAvi : c_ffMpegOptionsForMp4;
+
+            // This version has precise cuts
+            string arguments = $"-hide_banner -i \"{filename}\" -ss {start.Ticks / 10}us -to {end.Ticks / 10}us {options} \"{dstFilename}\"";
 
             Console.WriteLine(arguments);
 
